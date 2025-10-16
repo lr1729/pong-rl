@@ -17,12 +17,11 @@ the RL logic.
 from __future__ import annotations
 
 import argparse
-import math
-import time
+import atexit
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Iterable, List, Optional, Sequence, Tuple
+from typing import Deque, List, Optional, Sequence, Tuple
 
 import ale_py
 import gymnasium as gym
@@ -344,6 +343,130 @@ class FrameStack:
         return np.stack(self.frames, axis=0).astype(np.float32)
 
 
+class DemoSession:
+    """Maintain environment state for the interactive demo."""
+
+    def __init__(self, algo: str, checkpoint: Optional[Path]) -> None:
+        self.requested_algo = algo
+        self.algo = algo
+        self.device = _device()
+        self.env = make_env(render_mode="rgb_array")
+        self.policy: Optional[nn.Module] = None
+        self.checkpoint_path: Optional[Path] = None
+        self.agent_note: str = ""
+        self.prev_processed: Optional[np.ndarray] = None
+        self.frame_stack = FrameStack(4)
+        self.done = False
+        self.total_reward = 0.0
+        self.steps = 0
+
+        self._load_policy(checkpoint)
+        self.reset()
+
+    def _load_policy(self, checkpoint: Optional[Path]) -> None:
+        if self.algo == "random":
+            return
+
+        if checkpoint is None:
+            checkpoint = Path("checkpoints/pg.pth" if self.algo == "pg" else "checkpoints/ppo.pth")
+
+        if not checkpoint.exists():
+            self.agent_note = f"Checkpoint '{checkpoint}' not found. Falling back to random actions."
+            self.algo = "random"
+            return
+
+        data = torch.load(checkpoint, map_location=self.device)
+
+        if self.algo == "pg":
+            self.policy = PolicyNetwork().to(self.device)
+        else:
+            self.policy = CNNActorCritic().to(self.device)
+
+        self.policy.load_state_dict(data["model_state_dict"])
+        self.policy.eval()
+        self.checkpoint_path = checkpoint
+
+    def reset(self) -> np.ndarray:
+        observation, _ = self.env.reset()
+        self.last_obs = observation
+        self.prev_processed = None
+        self.frame_stack.reset()
+        self.frame_stack.push(preprocess_frame(observation))
+        self.done = False
+        self.total_reward = 0.0
+        self.steps = 0
+        return observation
+
+    def current_frame(self) -> np.ndarray:
+        return self.last_obs
+
+    def status_message(self) -> str:
+        agent_names = {
+            "random": "Random Actions",
+            "pg": "Policy Gradient (REINFORCE)",
+            "ppo": "PPO + CNN",
+        }
+        checkpoint_info = f" | Checkpoint: {self.checkpoint_path}" if self.checkpoint_path else ""
+        note = f"\n\n> {self.agent_note}" if self.agent_note else ""
+        return (
+            f"**Agent:** {agent_names.get(self.algo, self.algo)}{checkpoint_info}\n"
+            f"**Episode return:** {self.total_reward:+.0f} | **Steps:** {self.steps}{note}"
+        )
+
+    def step(self) -> Tuple[np.ndarray, str]:
+        reset_note = ""
+        if self.done:
+            self.reset()
+            reset_note = "Previous episode finished. Starting a new game."
+
+        if self.algo == "random" or self.policy is None:
+            env_action = int(self.env.action_space.sample())
+        elif self.algo == "pg":
+            processed = preprocess_frame(self.last_obs)
+            diff = difference_frame(processed, self.prev_processed)
+            self.prev_processed = processed
+            state_tensor = torch.from_numpy(diff.reshape(1, -1)).to(device=self.device, dtype=torch.float32)
+            with torch.no_grad():
+                prob = float(self.policy(state_tensor).item())
+            env_action = 2 if prob > 0.5 else 3
+        else:  # PPO
+            state_tensor = torch.from_numpy(self.frame_stack.as_array()).unsqueeze(0).to(
+                device=self.device, dtype=torch.float32
+            )
+            with torch.no_grad():
+                logits, _ = self.policy(state_tensor)
+                action_idx = torch.argmax(F.softmax(logits, dim=-1), dim=-1).item()
+            env_action = 2 if action_idx == 0 else 3
+
+        observation, reward, terminated, truncated, _ = self.env.step(env_action)
+        self.last_obs = observation
+        self.total_reward += reward
+        self.steps += 1
+        if self.algo == "ppo":
+            self.frame_stack.push(preprocess_frame(observation))
+
+        action_meanings = self.env.unwrapped.get_action_meanings()
+        action_label = action_meanings[env_action] if env_action < len(action_meanings) else str(env_action)
+
+        done = terminated or truncated
+        if done:
+            self.done = True
+
+        message = (
+            f"Action: {action_label} | Reward: {reward:+.0f} | "
+            f"Episode return: {self.total_reward:+.0f} | Done: {done}"
+        )
+        if reset_note:
+            message = f"{reset_note}\n{message}"
+        if done:
+            message += " — episode finished. Click Step to start a new game."
+
+        return observation, message
+
+    def close(self) -> None:
+        self.env.close()
+
+
 def ppo_update(
     policy: CNNActorCritic,
     optimizer: optim.Optimizer,
@@ -633,6 +756,57 @@ def watch_agent(checkpoint: Path, algo: str, episodes: int, render: bool) -> Non
     env.close()
 
 
+def launch_demo(algo: str, checkpoint: Optional[Path], host: str, port: int) -> None:
+    """Start an interactive demo server using Gradio."""
+    try:
+        import gradio as gr  # Lazy import to keep light dependencies for other commands.
+    except ImportError as exc:  # pragma: no cover - handled at runtime.
+        raise RuntimeError("Gradio is required for the demo. Install dependencies via `pip install -r requirements.txt`.") from exc
+
+    session = DemoSession(algo, checkpoint)
+    atexit.register(session.close)
+
+    initial_frame = session.current_frame()
+    initial_status = session.status_message()
+
+    def reset_handler() -> Tuple[np.ndarray, str]:
+        frame = session.reset()
+        status = f"{session.status_message()}\n\nEnvironment reset."
+        return frame, status
+
+    def step_handler() -> Tuple[np.ndarray, str]:
+        frame, event = session.step()
+        status = f"{session.status_message()}\n\n{event}"
+        return frame, status
+
+    with gr.Blocks(title="Pong RL Demo") as demo:
+        gr.Markdown(
+            "## Pong RL Interactive Demo\n"
+            "Use the buttons below to let the agent play one step at a time or reset the episode."
+        )
+        image = gr.Image(
+            value=initial_frame,
+            image_mode="RGB",
+            height=initial_frame.shape[0],
+            width=initial_frame.shape[1],
+            label="Game View",
+            show_label=True,
+        )
+        status = gr.Markdown(initial_status)
+        with gr.Row():
+            step_button = gr.Button("Step Agent", variant="primary")
+            reset_button = gr.Button("Reset Episode")
+
+        step_button.click(fn=step_handler, outputs=[image, status])
+        reset_button.click(fn=reset_handler, outputs=[image, status])
+
+    print(
+        f"[demo] Launching Pong demo on http://{host}:{port}. "
+        "When running on RunPod, open the provided proxy URL for this port."
+    )
+    demo.queue().launch(server_name=host, server_port=port, share=False, show_api=False)
+
+
 ###############################################################################
 # Command-line interface
 ###############################################################################
@@ -655,6 +829,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     watch_parser.add_argument("--algo", choices=("pg", "ppo"), required=True, help="Algorithm for the checkpoint.")
     watch_parser.add_argument("--episodes", type=int, default=3, help="Episodes to play.")
     watch_parser.add_argument("--no-render", action="store_true", help="Disable human rendering.")
+
+    demo_parser = subparsers.add_parser("demo", help="Launch the web-based interactive demo.")
+    demo_parser.add_argument("--algo", choices=("random", "pg", "ppo"), default="random", help="Agent used in demo.")
+    demo_parser.add_argument("--checkpoint", type=Path, default=None, help="Checkpoint for pg/ppo agents.")
+    demo_parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind the server.")
+    demo_parser.add_argument("--port", type=int, default=8080, help="Port for the demo server.")
 
     return parser.parse_args(argv)
 
@@ -685,6 +865,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             algo=args.algo,
             episodes=args.episodes,
             render=not args.no_render,
+        )
+    elif args.command == "demo":
+        launch_demo(
+            algo=args.algo,
+            checkpoint=args.checkpoint,
+            host=args.host,
+            port=args.port,
         )
 
 
