@@ -58,8 +58,10 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
 def difference_frame(current: np.ndarray, previous: Optional[np.ndarray]) -> np.ndarray:
     """Return the difference between consecutive frames (motion extraction)."""
     if previous is None:
-        return np.zeros_like(current, dtype=np.float32)
-    return current.astype(np.float32) - previous.astype(np.float32)
+        diff = np.zeros_like(current, dtype=np.float32)
+    else:
+        diff = current.astype(np.float32) - previous.astype(np.float32)
+    return diff.reshape(-1)
 
 
 def discount_rewards(rewards: Sequence[float], gamma: float) -> np.ndarray:
